@@ -8,12 +8,15 @@
 // 3，用户自己定义版本号规则。
 // 4，SingleFile的文件名最好全部是ASCII字符，最好不出现中文等等。
 // 5，在Mode_Read模式下支持多线程。
-// 6，尚未对资源包内的SingleFile做压缩处理，也没有任何加密。
+// 6，尚未对资源包内的SingleFile做加密。
 // 7，SingleFile的文件名长度不能超过SoPackageFileMAX_PATH。
 // 8，在Mode_Read模式下，为了快速定位要读取的文件，使用了哈希操作。魔兽世界的MPQ文件就是这么干的。
+// 9，加入了zlib压缩功能。
 //-----------------------------------------------------------------------------
 #include "SoPackageFile.h"
 #include "SoHash.h"
+#define ZLIB_WINAPI
+#include "zlib.h"
 //-----------------------------------------------------------------------------
 namespace GGUI
 {
@@ -25,6 +28,10 @@ namespace GGUI
 	,m_nSingleFileInfoListCapacity(0)
 	,m_nSingleFileInfoListSize(0)
 	,m_pHashList(0)
+	,m_pTempBuff_SrcFile(0)
+	,m_pTempBuff_AfterCompress(0)
+	,m_nTempBuffMaxSize_SrcFile(0)
+	,m_nTempBuffMaxSize_AfterCompress(0)
 	{
 		InitializeCriticalSection(&m_Lock);
 	}
@@ -127,6 +134,18 @@ namespace GGUI
 			free(m_pHashList);
 			m_pHashList = 0;
 		}
+		if (m_pTempBuff_SrcFile)
+		{
+			free(m_pTempBuff_SrcFile);
+			m_pTempBuff_SrcFile = 0;
+		}
+		if (m_pTempBuff_AfterCompress)
+		{
+			free(m_pTempBuff_AfterCompress);
+			m_pTempBuff_AfterCompress = 0;
+		}
+		m_nTempBuffMaxSize_SrcFile = 0;
+		m_nTempBuffMaxSize_AfterCompress = 0;
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
@@ -180,38 +199,65 @@ namespace GGUI
 		{
 			return Result_InvalidFileID;
 		}
-		//把nElementCount修正一下。
-		if (nElementCount * nElementSize > theFile.nFileSize - theFile.nFilePointer)
-		{
-			nElementCount = (theFile.nFileSize - theFile.nFilePointer) / nElementSize;
-		}
-		EnterCriticalSection(&m_Lock);
 		if (m_theFileMode != Mode_Read)
 		{
-			LeaveCriticalSection(&m_Lock);
 			return Result_FileModeMismatch;
 		}
 		if (m_pFile == 0)
 		{
-			LeaveCriticalSection(&m_Lock);
 			return Result_PackageFileHaveNotOpen;
 		}
 		if (theFile.nFileID >= m_nSingleFileInfoListSize)
 		{
-			LeaveCriticalSection(&m_Lock);
 			return Result_InvalidFileID;
 		}
-		const stSingleFileInfo& theFileInfo = m_pSingleFileInfoList[theFile.nFileID];
-		soint64 nSeekResult = _fseeki64(m_pFile, theFileInfo.nOffset+theFile.nFilePointer, SEEK_SET);
-		if (nSeekResult != 0)
+		if (theFile.pFileBuff == 0)
 		{
+			//源文件尚未从资源包内读取出来。
+			EnterCriticalSection(&m_Lock);
+			const stSingleFileInfo& theFileInfo = m_pSingleFileInfoList[theFile.nFileID];
+			TryResizeTempBuff_AfterCompress(theFileInfo.nEmbededFileSize);
+			TryResizeTempBuff_SrcFile(theFileInfo.nOriginalFileSize + 1024000); //因为要解压缩，所以适当多申请一些内存。
+			//
+			soint64 nSeekResult = _fseeki64(m_pFile, theFileInfo.nOffset, SEEK_SET);
+			if (nSeekResult != 0)
+			{
+				LeaveCriticalSection(&m_Lock);
+				return Result_FileOperationError;
+			}
+			soint64 nActuallyReadCount = fread(m_pTempBuff_AfterCompress, 1, (size_t)theFileInfo.nEmbededFileSize, m_pFile);
+			if (nActuallyReadCount != theFileInfo.nEmbededFileSize)
+			{
+				LeaveCriticalSection(&m_Lock);
+				return Result_FileOperationError;
+			}
+			//解压缩。
+			uLongf nSizeAfterUncompress = (uLongf)m_nTempBuffMaxSize_SrcFile;
+			int nResult = uncompress((Bytef*)m_pTempBuff_SrcFile, &nSizeAfterUncompress, (Bytef*)m_pTempBuff_AfterCompress, theFileInfo.nEmbededFileSize);
+			if (nResult != Z_OK)
+			{
+				LeaveCriticalSection(&m_Lock);
+				return Result_UncompressFail;
+			}
+			if ((soint64)nSizeAfterUncompress != theFileInfo.nOriginalFileSize)
+			{
+				LeaveCriticalSection(&m_Lock);
+				return Result_FileSizeNotMatchAfterUncompress;
+			}
+			theFile.pFileBuff = (char*)malloc(theFileInfo.nOriginalFileSize);
+			memcpy(theFile.pFileBuff, m_pTempBuff_SrcFile, theFileInfo.nOriginalFileSize);
 			LeaveCriticalSection(&m_Lock);
-			return Result_FileOperationError;
 		}
-		nActuallyReadCount = fread(pBuff, (size_t)nElementSize, (size_t)nElementCount, m_pFile);
-		LeaveCriticalSection(&m_Lock);
+		nActuallyReadCount = nElementCount;
+		//把nActuallyReadCount修正一下。
+		if (nElementCount * nElementSize > theFile.nFileSize - theFile.nFilePointer)
+		{
+			nActuallyReadCount = (theFile.nFileSize - theFile.nFilePointer) / nElementSize;
+		}
+		soint64 nActuallyReadSize = nActuallyReadCount * nElementSize;
+		memcpy(pBuff, theFile.pFileBuff+theFile.nFilePointer, nActuallyReadSize);
 		//读取完毕。
-		theFile.nFilePointer += nElementSize * nActuallyReadCount;
+		theFile.nFilePointer += nActuallyReadSize;
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
@@ -399,32 +445,40 @@ namespace GGUI
 			return Result_FileOperationError;
 		}
 		//读取源文件。
-		char* pBuff = (char*)malloc((size_t)(theFileInfo.nOriginalFileSize));
+		TryResizeTempBuff_SrcFile(theFileInfo.nOriginalFileSize);
 		const size_t sizeOriginalFileSize = (size_t)(theFileInfo.nOriginalFileSize);
-		size_t nActuallyRead = fread(pBuff, 1, sizeOriginalFileSize, pSingleFile);
+		size_t nActuallyRead = fread(m_pTempBuff_SrcFile, 1, sizeOriginalFileSize, pSingleFile);
 		if (nActuallyRead != sizeOriginalFileSize)
 		{
-			free(pBuff);
 			return Result_FileOperationError;
 		}
 		if (feof(pSingleFile) != 0)
 		{
 			//越界了，这不应该发生。
 			//这时，文件指针应该在文件末尾，再读一个字节才会越界。
-			free(pBuff);
 			return Result_FileOperationError;
 		}
-		//写入到资源包。
-		size_t nActuallyWrite = fwrite(pBuff, 1, sizeOriginalFileSize, m_pFile);
-		if (nActuallyWrite != sizeOriginalFileSize)
+		//<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+		//对源文件进行压缩。
+		//某些情况下，压缩后的文件要比压缩前还要大，例如文件本来就很小（只有几个字节），
+		//或者文件本身就是zlib压缩过的，再经过压缩就变的大一点（PNG格式就是已经经过zlib压缩过的）。
+		TryResizeTempBuff_AfterCompress(theFileInfo.nOriginalFileSize + 1024000);
+		uLongf nSizeAfterCompress = (uLongf)m_nTempBuffMaxSize_AfterCompress;
+		int nResult = compress((Bytef*)m_pTempBuff_AfterCompress, &nSizeAfterCompress, (Bytef*)m_pTempBuff_SrcFile, sizeOriginalFileSize);
+		if (nResult != Z_OK)
 		{
-			free(pBuff);
+			return Result_CompressFail;
+		}
+		//>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+		//写入到资源包。
+		const size_t sizeFileSizeAfterCompress = (size_t)nSizeAfterCompress;
+		size_t nActuallyWrite = fwrite(m_pTempBuff_AfterCompress, 1, sizeFileSizeAfterCompress, m_pFile);
+		if (nActuallyWrite != sizeFileSizeAfterCompress)
+		{
 			return Result_FileOperationError;
 		}
-		free(pBuff);
 		//完善参数。
-		//没有进行压缩操作。
-		theFileInfo.nEmbededFileSize = theFileInfo.nOriginalFileSize;
+		theFileInfo.nEmbededFileSize = sizeFileSizeAfterCompress;
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
@@ -602,6 +656,58 @@ namespace GGUI
 		}
 	}
 	//-----------------------------------------------------------------------------
+	void SoPackageFile::TryResizeTempBuff_SrcFile(soint64 nDestSize)
+	{
+		soint64 nRealDestSize = 0;
+		if (m_pTempBuff_SrcFile)
+		{
+			if (m_nTempBuffMaxSize_SrcFile < nDestSize)
+			{
+				nRealDestSize = nDestSize * 2;
+			}
+		}
+		else
+		{
+			nRealDestSize = nDestSize;
+		}
+		if (nRealDestSize > 0)
+		{
+			if (m_pTempBuff_SrcFile)
+			{
+				free(m_pTempBuff_SrcFile);
+				m_pTempBuff_SrcFile = 0;
+			}
+			m_pTempBuff_SrcFile = (char*)malloc(nRealDestSize);
+			m_nTempBuffMaxSize_SrcFile = nRealDestSize;
+		}
+	}
+	//-----------------------------------------------------------------------------
+	void SoPackageFile::TryResizeTempBuff_AfterCompress(soint64 nDestSize)
+	{
+		soint64 nRealDestSize = 0;
+		if (m_pTempBuff_AfterCompress)
+		{
+			if (m_nTempBuffMaxSize_AfterCompress < nDestSize)
+			{
+				nRealDestSize = nDestSize * 2;
+			}
+		}
+		else
+		{
+			nRealDestSize = nDestSize;
+		}
+		if (nRealDestSize > 0)
+		{
+			if (m_pTempBuff_AfterCompress)
+			{
+				free(m_pTempBuff_AfterCompress);
+				m_pTempBuff_AfterCompress = 0;
+			}
+			m_pTempBuff_AfterCompress = (char*)malloc(nRealDestSize);
+			m_nTempBuffMaxSize_AfterCompress = nRealDestSize;
+		}
+	}
+	//-----------------------------------------------------------------------------
 	soint64 SoPackageFile::AssignSingleFileInfo()
 	{
 		soint64 nResult = -1;
@@ -725,44 +831,44 @@ namespace GGUI
 		}
 		return br;
 	}
-	//-----------------------------------------------------------------------------
-	bool SoPackageFile::CheckValid_SingleFileInfo(const SoPackageFile::stSingleFileInfo& theSingleFile)
-	{
-		bool br = true;
-		//判断文件名
-		if (br)
-		{
-			if (theSingleFile.szFileName[0] == 0 //文件名为空
-				|| theSingleFile.szFileName[SoPackageFileMAX_PATH-1] != 0) //不是以0结尾的字符串
-			{
-				br = false;
-			}
-		}
-		//
-		if (br)
-		{
-			if (theSingleFile.nOriginalFileSize <= 0)
-			{
-				br = false;
-			}
-		}
-		//
-		if (br)
-		{
-			if (theSingleFile.nEmbededFileSize <= 0)
-			{
-				br = false;
-			}
-		}
-		//
-		if (br)
-		{
-			if (theSingleFile.nOffset < sizeof(stPackageHead))
-			{
-				br = false;
-			}
-		}
-		return br;
-	}
+	////-----------------------------------------------------------------------------
+	//bool SoPackageFile::CheckValid_SingleFileInfo(const SoPackageFile::stSingleFileInfo& theSingleFile)
+	//{
+	//	bool br = true;
+	//	//判断文件名
+	//	if (br)
+	//	{
+	//		if (theSingleFile.szFileName[0] == 0 //文件名为空
+	//			|| theSingleFile.szFileName[SoPackageFileMAX_PATH-1] != 0) //不是以0结尾的字符串
+	//		{
+	//			br = false;
+	//		}
+	//	}
+	//	//
+	//	if (br)
+	//	{
+	//		if (theSingleFile.nOriginalFileSize <= 0)
+	//		{
+	//			br = false;
+	//		}
+	//	}
+	//	//
+	//	if (br)
+	//	{
+	//		if (theSingleFile.nEmbededFileSize <= 0)
+	//		{
+	//			br = false;
+	//		}
+	//	}
+	//	//
+	//	if (br)
+	//	{
+	//		if (theSingleFile.nOffset < sizeof(stPackageHead))
+	//		{
+	//			br = false;
+	//		}
+	//	}
+	//	return br;
+	//}
 }
 //-----------------------------------------------------------------------------
