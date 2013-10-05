@@ -7,14 +7,13 @@
 #define _SoPackageFile_h_
 //-----------------------------------------------------------------------------
 #include <stdio.h>
-#include <string>
-#include <map>
 #include <Windows.h>
+#include "SoBaseTypeDefine.h"
 //-----------------------------------------------------------------------------
 #define SoPackageFileFlag "SOPACKAG"
 #define SoPackageFileFlagLength 8
 #define SoPackageFileVersion 1
-#define SoPackageFileMAX_PATH 150
+#define SoPackageFileMAX_PATH 256
 //-----------------------------------------------------------------------------
 namespace GGUI
 {
@@ -49,6 +48,7 @@ namespace GGUI
 			Result_SingleFileNotExist, //文件不存在。
 			Result_InvalidFileID, //FileID不正确。
 			Result_FileNameLengthTooLong, //文件名太长了。
+			Result_BuildHashListFail, //构建哈希map时失败了。
 		};
 		//资源包文件头。
 		struct stPackageHead
@@ -56,11 +56,11 @@ namespace GGUI
 			//文件标志。
 			char szFileFlag[SoPackageFileFlagLength];
 			//版本号。
-			__int64 nVersion;
+			soint64 nVersion;
 			//一共有多少个SingleFile。
-			__int64 nFileCount;
+			soint64 nFileCount;
 			//SingleFile信息集合中，第一个stSingleFileInfo距离文件开始处的偏移量。
-			__int64 nOffsetForFirstSingleFileInfo;
+			soint64 nOffsetForFirstSingleFileInfo;
 
 			stPackageHead()
 			{
@@ -78,25 +78,45 @@ namespace GGUI
 			//文件名
 			char szFileName[SoPackageFileMAX_PATH];
 			//文件原始大小
-			__int64 nOriginalFileSize;
+			soint64 nOriginalFileSize;
 			//文件在资源包内的大小（有可能经过了压缩）
-			__int64 nEmbededFileSize;
+			soint64 nEmbededFileSize;
 			//该文件距离资源包文件开始处的偏移量。
-			__int64 nOffset;
+			soint64 nOffset;
+			//把文件名映射成一个数字。
+			//经过三个不同的哈希函数的计算，得到三个哈希值。
+			souint32 uiHashA;
+			souint32 uiHashB;
+			souint32 uiHashC;
 
+			stSingleFileInfo()
+			{
+				Clear();
+			}
 			void Clear()
 			{
 				memset(this, 0, sizeof(*this));
 			}
 		};
+		//在Mode_Read模式下，根据外界提供的文件名，找到该文件在SingleFileInfoList中的
+		//索引位置。
+		struct stHashInfo
+		{
+			souint32 uiIndex_SingleFileInfoList;
+			//把文件名映射成一个数字。
+			//经过三个不同的哈希函数的计算，得到三个哈希值。
+			souint32 uiHashA;
+			souint32 uiHashB;
+			souint32 uiHashC;
+		};
 		struct stReadSingleFile
 		{
 			//资源包内每个文件都有一个文件ID。-1为无效值。
-			__int64 nFileID;
+			soint64 nFileID;
 			//文件原始大小。
-			__int64 nFileSize;
+			soint64 nFileSize;
 			//文件指针。
-			__int64 nFilePointer;
+			soint64 nFilePointer;
 			//存储文件原始的完整内容。
 			//如果资源包内对SingleFile做了压缩操作，则pFileBuff存储解压之后的原始文件，
 			//才能向外界提供对SingleFile的读操作。
@@ -127,9 +147,9 @@ namespace GGUI
 		//<<<<<<<<<<<<<<<< 从资源包内读取一个文件 <<<<<<<<<<<<<<<<<<<<<<<<<
 		OperationResult Open(const char* pszFileName, stReadSingleFile& theFile);
 		OperationResult Close(stReadSingleFile& theFile);
-		OperationResult Read(void* pBuff, __int64 nElementSize, __int64 nElementCount, __int64& nActuallyReadCount, stReadSingleFile& theFile);
-		OperationResult Tell(__int64& nFilePos, stReadSingleFile& theFile);
-		OperationResult Seek(__int64 nOffset, SeekOrigin theOrigin, stReadSingleFile& theFile);
+		OperationResult Read(void* pBuff, soint64 nElementSize, soint64 nElementCount, soint64& nActuallyReadCount, stReadSingleFile& theFile);
+		OperationResult Tell(soint64& nFilePos, stReadSingleFile& theFile);
+		OperationResult Seek(soint64 nOffset, SeekOrigin theOrigin, stReadSingleFile& theFile);
 		//>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 		//<<<<<<<<<<<<<<<< 把一个磁盘文件写入资源包 <<<<<<<<<<<<<<<<<<<<<<<
@@ -146,10 +166,13 @@ namespace GGUI
 		OperationResult WriteAllSingleFileInfo();
 		//解析资源包，即提取资源包已有的文件结构信息。
 		OperationResult ParsePackageFile();
+		//在Mode_Read模式下，构建m_pHashList，帮助快速定位目标文件。
+		OperationResult BuildHashList();
 
-		void ReCreateSingleFileInfoList(__int64 nCapacity);
+		void ReCreateSingleFileInfoList(soint64 nCapacity);
 		void ReleaseSingleFileInfoList();
-		__int64 AssignSingleFileInfo();
+		soint64 AssignSingleFileInfo();
+		soint64 GetIndex_SingleFileInfoList(const char* pszFileName);
 
 		//把文件名格式化成如下格式：
 		//1，把'\\'修改成'/'；
@@ -161,9 +184,6 @@ namespace GGUI
 		bool CheckValid_SingleFileInfo(const stSingleFileInfo& theSingleFile);
 
 	private:
-		typedef std::map<std::string, __int64> mapFileName2FileID;
-
-	private:
 		FileMode m_theFileMode;
 		FILE* m_pFile;
 		//文件头。
@@ -171,10 +191,11 @@ namespace GGUI
 		//SingleFile信息列表。
 		stSingleFileInfo* m_pSingleFileInfoList;
 		//m_pSingleFileInfoList中可以容纳多少个stSingleFileInfo对象。
-		__int64 m_nSingleFileInfoListCapacity;
+		soint64 m_nSingleFileInfoListCapacity;
 		//m_pSingleFileInfoList中有效stSingleFileInfo对象的个数。
-		__int64 m_nSingleFileInfoListSize;
-		mapFileName2FileID m_mapFileName2FileID;
+		soint64 m_nSingleFileInfoListSize;
+		//在Mode_Read模式下，帮助快速定位目标文件。
+		stHashInfo* m_pHashList;
 		//多线程锁。
 		CRITICAL_SECTION m_Lock;
 	};

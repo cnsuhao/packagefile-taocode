@@ -10,8 +10,10 @@
 // 5，在Mode_Read模式下支持多线程。
 // 6，尚未对资源包内的SingleFile做压缩处理，也没有任何加密。
 // 7，SingleFile的文件名长度不能超过SoPackageFileMAX_PATH。
+// 8，在Mode_Read模式下，为了快速定位要读取的文件，使用了哈希操作。魔兽世界的MPQ文件就是这么干的。
 //-----------------------------------------------------------------------------
 #include "SoPackageFile.h"
+#include "SoHash.h"
 //-----------------------------------------------------------------------------
 namespace GGUI
 {
@@ -22,6 +24,7 @@ namespace GGUI
 	,m_pSingleFileInfoList(0)
 	,m_nSingleFileInfoListCapacity(0)
 	,m_nSingleFileInfoListSize(0)
+	,m_pHashList(0)
 	{
 		InitializeCriticalSection(&m_Lock);
 	}
@@ -119,7 +122,11 @@ namespace GGUI
 		}
 		m_stPackageHead.Clear();
 		ReleaseSingleFileInfoList();
-		m_mapFileName2FileID.clear();
+		if (m_pHashList)
+		{
+			free(m_pHashList);
+			m_pHashList = 0;
+		}
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
@@ -130,32 +137,27 @@ namespace GGUI
 			//空指针或者空字符串。
 			return Result_InvalidParam;
 		}
-		EnterCriticalSection(&m_Lock);
 		if (m_theFileMode != Mode_Read)
 		{
-			LeaveCriticalSection(&m_Lock);
 			return Result_FileModeMismatch;
 		}
 		if (m_pFile == 0)
 		{
-			LeaveCriticalSection(&m_Lock);
 			return Result_PackageFileHaveNotOpen;
 		}
-		LeaveCriticalSection(&m_Lock);
 		//格式化文件名。
 		char szFormatFileName[SoPackageFileMAX_PATH];
 		FormatFileFullName(szFormatFileName, pszFileName);
-		std::string strFileName(szFormatFileName);
-		//判断该文件是否存在。
 		EnterCriticalSection(&m_Lock);
-		mapFileName2FileID::iterator it = m_mapFileName2FileID.find(strFileName);
-		if (it == m_mapFileName2FileID.end())
+		//从m_pSingleFileInfoList中找到索引位置。
+		soint64 theIndex_SingleFileInfoList = GetIndex_SingleFileInfoList(szFormatFileName);
+		if (theIndex_SingleFileInfoList == -1)
 		{
 			//文件不存在。
 			LeaveCriticalSection(&m_Lock);
 			return Result_SingleFileNotExist;
 		}
-		theFile.nFileID = it->second;
+		theFile.nFileID = theIndex_SingleFileInfoList;
 		theFile.nFileSize = m_pSingleFileInfoList[theFile.nFileID].nOriginalFileSize;
 		LeaveCriticalSection(&m_Lock);
 		return Result_OK;
@@ -167,7 +169,7 @@ namespace GGUI
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
-	SoPackageFile::OperationResult SoPackageFile::Read(void* pBuff, __int64 nElementSize, __int64 nElementCount, __int64& nActuallyReadCount, stReadSingleFile& theFile)
+	SoPackageFile::OperationResult SoPackageFile::Read(void* pBuff, soint64 nElementSize, soint64 nElementCount, soint64& nActuallyReadCount, stReadSingleFile& theFile)
 	{
 		nActuallyReadCount = 0;
 		if (pBuff == 0)
@@ -200,7 +202,7 @@ namespace GGUI
 			return Result_InvalidFileID;
 		}
 		const stSingleFileInfo& theFileInfo = m_pSingleFileInfoList[theFile.nFileID];
-		__int64 nSeekResult = _fseeki64(m_pFile, theFileInfo.nOffset+theFile.nFilePointer, SEEK_SET);
+		soint64 nSeekResult = _fseeki64(m_pFile, theFileInfo.nOffset+theFile.nFilePointer, SEEK_SET);
 		if (nSeekResult != 0)
 		{
 			LeaveCriticalSection(&m_Lock);
@@ -213,15 +215,15 @@ namespace GGUI
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
-	SoPackageFile::OperationResult SoPackageFile::Tell(__int64& nFilePos, stReadSingleFile& theFile)
+	SoPackageFile::OperationResult SoPackageFile::Tell(soint64& nFilePos, stReadSingleFile& theFile)
 	{
 		nFilePos = theFile.nFilePointer;
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
-	SoPackageFile::OperationResult SoPackageFile::Seek(__int64 nOffset, SeekOrigin theOrigin, stReadSingleFile& theFile)
+	SoPackageFile::OperationResult SoPackageFile::Seek(soint64 nOffset, SeekOrigin theOrigin, stReadSingleFile& theFile)
 	{
-		__int64 destPos = 0;
+		soint64 destPos = 0;
 		switch (theOrigin)
 		{
 		case Seek_Set:
@@ -255,7 +257,7 @@ namespace GGUI
 			//无效指针或者是空字符串。
 			return Result_InvalidParam;
 		}
-		__int64 nDiskFileNameLength = strlen(pszDiskFile);
+		soint64 nDiskFileNameLength = strlen(pszDiskFile);
 		if (nDiskFileNameLength >= SoPackageFileMAX_PATH)
 		{
 			return Result_FileNameLengthTooLong;
@@ -268,51 +270,58 @@ namespace GGUI
 		{
 			return Result_PackageFileHaveNotOpen;
 		}
+		//
+		stSingleFileInfo newSingleFile;
+		FormatFileFullName(newSingleFile.szFileName, pszDiskFile);
+		newSingleFile.uiHashA = SoHash_Index(newSingleFile.szFileName);
+		newSingleFile.uiHashB = SoHash_PHP(newSingleFile.szFileName);
+		newSingleFile.uiHashC = SoHash_BKDR(newSingleFile.szFileName);
+		//判断该文件是否已经存在了。
+		bool bAlreadyExist = false;
+		for (soint64 i=0; i<m_nSingleFileInfoListSize; ++i)
+		{
+			if (newSingleFile.uiHashA == m_pSingleFileInfoList[i].uiHashA
+				&& newSingleFile.uiHashB == m_pSingleFileInfoList[i].uiHashB
+				&& newSingleFile.uiHashC == m_pSingleFileInfoList[i].uiHashC)
+			{
+				bAlreadyExist = true;
+				break;
+			}
+		}
+		if (bAlreadyExist)
+		{
+			return Result_SingleFileAlreadyExist;
+		}
 		//打开磁盘文件。
-		FILE* pSingleFile = fopen(pszDiskFile, "rb");
+		FILE* pSingleFile = fopen(newSingleFile.szFileName, "rb");
 		if (pSingleFile == 0)
 		{
 			return Result_OpenFileFail;
 		}
 		//获取磁盘文件大小。
 		_fseeki64(pSingleFile, 0, SEEK_END);
-		__int64 nDiskFileSize = _ftelli64(pSingleFile);
-		//分配结构体对象，并填充参数。
-		__int64 nFileID = AssignSingleFileInfo();
-		if (nFileID == -1)
-		{
-			fclose(pSingleFile);
-			return Result_MemoryIsEmpty;
-		}
-		FormatFileFullName(m_pSingleFileInfoList[nFileID].szFileName, pszDiskFile);
-		m_pSingleFileInfoList[nFileID].nOriginalFileSize = nDiskFileSize;
-		m_pSingleFileInfoList[nFileID].nOffset = m_stPackageHead.nOffsetForFirstSingleFileInfo;
-		//判断该文件是否已经存在了。
-		mapFileName2FileID::iterator it = m_mapFileName2FileID.find(std::string(m_pSingleFileInfoList[nFileID].szFileName));
-		if (it != m_mapFileName2FileID.end())
-		{
-			//文件已经存在了，不能再次写入。
-			fclose(pSingleFile);
-			//回收SingleFile信息。
-			m_pSingleFileInfoList[nFileID].Clear();
-			--m_nSingleFileInfoListSize;
-			return Result_SingleFileAlreadyExist;
-		}
+		soint64 nDiskFileSize = _ftelli64(pSingleFile);
+		newSingleFile.nOriginalFileSize = nDiskFileSize;
+		newSingleFile.nOffset = m_stPackageHead.nOffsetForFirstSingleFileInfo;
 		//向资源包中写入这个文件。
-		OperationResult writeResult = WriteSingleFile(pSingleFile, m_pSingleFileInfoList[nFileID]);
+		OperationResult writeResult = WriteSingleFile(pSingleFile, newSingleFile);
+		fclose(pSingleFile);
+		pSingleFile = 0;
 		if (writeResult != Result_OK)
 		{
 			//写入失败。
-			fclose(pSingleFile);
-			//回收SingleFile信息。
-			m_pSingleFileInfoList[nFileID].Clear();
-			--m_nSingleFileInfoListSize;
 			return writeResult;
 		}
+		//分配结构体对象，并填充参数。
+		soint64 nFileID = AssignSingleFileInfo();
+		if (nFileID == -1)
+		{
+			return Result_MemoryIsEmpty;
+		}
+		memcpy(&(m_pSingleFileInfoList[nFileID]), &newSingleFile, sizeof(stSingleFileInfo));
 		//完善文件头信息。
 		++m_stPackageHead.nFileCount;
 		m_stPackageHead.nOffsetForFirstSingleFileInfo += m_pSingleFileInfoList[nFileID].nEmbededFileSize;
-		m_mapFileName2FileID.insert(make_pair(std::string(m_pSingleFileInfoList[nFileID].szFileName), nFileID));
 		return Result_OK;
 	}
 	//-----------------------------------------------------------------------------
@@ -345,14 +354,14 @@ namespace GGUI
 		{
 			return Result_PackageFileHaveNotOpen;
 		}
-		__int64 nSeekResult = _fseeki64(m_pFile, 0, SEEK_SET);
+		soint64 nSeekResult = _fseeki64(m_pFile, 0, SEEK_SET);
 		if (nSeekResult != 0)
 		{
 			return Result_FileOperationError;
 		}
 		//生成合法的文件头。
 		const char* pszFileFlag = SoPackageFileFlag;
-		for (__int64 i=0; i<SoPackageFileFlagLength; ++i)
+		for (soint64 i=0; i<SoPackageFileFlagLength; ++i)
 		{
 			m_stPackageHead.szFileFlag[i] = pszFileFlag[i];
 		}
@@ -379,7 +388,7 @@ namespace GGUI
 			return Result_PackageFileHaveNotOpen;
 		}
 		//调整文件指针位置，准备写入。
-		__int64 nSeekResult = _fseeki64(pSingleFile, 0, SEEK_SET);
+		soint64 nSeekResult = _fseeki64(pSingleFile, 0, SEEK_SET);
 		if (nSeekResult != 0)
 		{
 			return Result_FileOperationError;
@@ -426,7 +435,7 @@ namespace GGUI
 		{
 			return Result_PackageFileHaveNotOpen;
 		}
-		__int64 nSeekResult = _fseeki64(m_pFile, m_stPackageHead.nOffsetForFirstSingleFileInfo, SEEK_SET);
+		soint64 nSeekResult = _fseeki64(m_pFile, m_stPackageHead.nOffsetForFirstSingleFileInfo, SEEK_SET);
 		if (nSeekResult != 0)
 		{
 			return Result_FileOperationError;
@@ -448,7 +457,7 @@ namespace GGUI
 		{
 			return Result_PackageFileHaveNotOpen;
 		}
-		__int64 nSeekResult = _fseeki64(m_pFile, 0, SEEK_SET);
+		soint64 nSeekResult = _fseeki64(m_pFile, 0, SEEK_SET);
 		if (nSeekResult != 0)
 		{
 			return Result_FileOperationError;
@@ -487,24 +496,69 @@ namespace GGUI
 		}
 		//SingleFile信息列表读取成功。
 		m_nSingleFileInfoListSize = m_stPackageHead.nFileCount;
-		//下面生成文件名到文件ID的映射。
-		m_mapFileName2FileID.clear();
-		for (__int64 i=0; i<m_stPackageHead.nFileCount; ++i)
+		//如果是Mode_Read模式，则生成m_pHashList，帮助快速定位目标文件。
+		if (m_theFileMode == Mode_Read)
 		{
-			if (CheckValid_SingleFileInfo(m_pSingleFileInfoList[i]))
+			return BuildHashList();
+		}
+		else
+		{
+			return Result_OK;
+		}
+	}
+	//-----------------------------------------------------------------------------
+	SoPackageFile::OperationResult SoPackageFile::BuildHashList()
+	{
+		OperationResult theResult = Result_OK;
+		if (m_pHashList)
+		{
+			free(m_pHashList);
+		}
+		const souint32 uiCount = (souint32)m_nSingleFileInfoListSize;
+		const size_t theSize = (size_t)(uiCount * sizeof(stHashInfo));
+		m_pHashList = (stHashInfo*)malloc(theSize);
+		memset(m_pHashList, 0, theSize);
+		//
+		for (souint32 i=0; i<uiCount; ++i)
+		{
+			souint32 uiIndex = m_pSingleFileInfoList[i].uiHashA % uiCount;
+			//根据哈希值的计算，uiIndex是应该放置的位置，但是这个位置上可能已经有值了，
+			//则顺延找到一个空的位置。
+			bool bFindEmpty = false;
+			for (souint32 j=0; j<uiCount; ++j)
 			{
-				m_mapFileName2FileID.insert(make_pair(std::string(m_pSingleFileInfoList[i].szFileName), i));
+				souint32 uiCheckIndex = uiIndex + j;
+				if (uiCheckIndex >= uiCount)
+				{
+					uiCheckIndex = uiCheckIndex - uiCount;
+				}
+				if (m_pHashList[uiCheckIndex].uiHashA == 0
+					&& m_pHashList[uiCheckIndex].uiHashB == 0
+					&& m_pHashList[uiCheckIndex].uiHashC == 0)
+				{
+					//uiCheckIndex位置的元素为空。
+					uiIndex = uiCheckIndex;
+					bFindEmpty = true;
+					break;
+				}
+			}
+			if (bFindEmpty)
+			{
+				m_pHashList[uiIndex].uiIndex_SingleFileInfoList = i;
+				m_pHashList[uiIndex].uiHashA = m_pSingleFileInfoList[i].uiHashA;
+				m_pHashList[uiIndex].uiHashB = m_pSingleFileInfoList[i].uiHashB;
+				m_pHashList[uiIndex].uiHashC = m_pSingleFileInfoList[i].uiHashC;
 			}
 			else
 			{
-				//出现了无效的文件信息，很可能整个资源包都被破坏了。
-				m_pSingleFileInfoList[i].Clear();
+				theResult = Result_BuildHashListFail;
+				break;
 			}
 		}
-		return Result_OK;
+		return theResult;
 	}
 	//-----------------------------------------------------------------------------
-	void SoPackageFile::ReCreateSingleFileInfoList(__int64 nCapacity)
+	void SoPackageFile::ReCreateSingleFileInfoList(soint64 nCapacity)
 	{
 		stSingleFileInfo* pSingleFileInfoList_Temp = m_pSingleFileInfoList;
 		//
@@ -548,9 +602,9 @@ namespace GGUI
 		}
 	}
 	//-----------------------------------------------------------------------------
-	__int64 SoPackageFile::AssignSingleFileInfo()
+	soint64 SoPackageFile::AssignSingleFileInfo()
 	{
-		__int64 nResult = -1;
+		soint64 nResult = -1;
 		//
 		if (m_nSingleFileInfoListSize >= m_nSingleFileInfoListCapacity)
 		{
@@ -565,9 +619,36 @@ namespace GGUI
 		return nResult;
 	}
 	//-----------------------------------------------------------------------------
+	soint64 SoPackageFile::GetIndex_SingleFileInfoList(const char* pszFileName)
+	{
+		soint64 theIndex = -1;
+		const souint32 uiHashA = SoHash_Index(pszFileName);
+		const souint32 uiHashB = SoHash_PHP(pszFileName);
+		const souint32 uiHashC = SoHash_BKDR(pszFileName);
+		const souint32 uiCount = (souint32)m_nSingleFileInfoListSize;
+		souint32 uiIndex = uiHashA % uiCount;
+		//
+		for (souint32 j=0; j<uiCount; ++j)
+		{
+			souint32 uiCheckIndex = uiIndex + j;
+			if (uiCheckIndex >= uiCount)
+			{
+				uiCheckIndex = uiCheckIndex - uiCount;
+			}
+			if (m_pHashList[uiCheckIndex].uiHashA == uiHashA
+				&& m_pHashList[uiCheckIndex].uiHashB == uiHashB
+				&& m_pHashList[uiCheckIndex].uiHashC == uiHashC)
+			{
+				theIndex = m_pHashList[uiCheckIndex].uiIndex_SingleFileInfoList;
+				break;
+			}
+		}
+		return theIndex;
+	}
+	//-----------------------------------------------------------------------------
 	void SoPackageFile::FormatFileFullName(char* pszOut, const char* pszIn) const
 	{
-		__int64 nCount = 0;
+		soint64 nCount = 0;
 		while (pszIn[nCount] != 0)
 		{
 			char theC = pszIn[nCount];
@@ -602,7 +683,7 @@ namespace GGUI
 		if (br)
 		{
 			const char* pszFileFlag = SoPackageFileFlag;
-			for (__int64 i=0; i<SoPackageFileFlagLength; ++i)
+			for (soint64 i=0; i<SoPackageFileFlagLength; ++i)
 			{
 				if (theHead.szFileFlag[i] != pszFileFlag[i])
 				{
