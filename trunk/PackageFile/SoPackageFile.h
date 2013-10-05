@@ -49,6 +49,9 @@ namespace GGUI
 			Result_InvalidFileID, //FileID不正确。
 			Result_FileNameLengthTooLong, //文件名太长了。
 			Result_BuildHashListFail, //构建哈希map时失败了。
+			Result_CompressFail, //对源文件执行压缩操作时失败了。
+			Result_UncompressFail, //执行解压缩失败了。
+			Result_FileSizeNotMatchAfterUncompress, //解压缩后文件大小与stSingleFileInfo描述的源文件大小不一致。
 		};
 		//资源包文件头。
 		struct stPackageHead
@@ -171,6 +174,8 @@ namespace GGUI
 
 		void ReCreateSingleFileInfoList(soint64 nCapacity);
 		void ReleaseSingleFileInfoList();
+		void TryResizeTempBuff_SrcFile(soint64 nDestSize);
+		void TryResizeTempBuff_AfterCompress(soint64 nDestSize);
 		soint64 AssignSingleFileInfo();
 		soint64 GetIndex_SingleFileInfoList(const char* pszFileName);
 
@@ -180,8 +185,8 @@ namespace GGUI
 		void FormatFileFullName(char* pszOut, const char* pszIn) const;
 		//判断文件头是否合法。合法返回true，不合法返回false。
 		bool CheckValid_PackageHead(const stPackageHead& theHead);
-		//判断SingleFile信息是否合法。合法返回true，不合法返回false。
-		bool CheckValid_SingleFileInfo(const stSingleFileInfo& theSingleFile);
+		////判断SingleFile信息是否合法。合法返回true，不合法返回false。
+		//bool CheckValid_SingleFileInfo(const stSingleFileInfo& theSingleFile);
 
 	private:
 		FileMode m_theFileMode;
@@ -196,6 +201,11 @@ namespace GGUI
 		soint64 m_nSingleFileInfoListSize;
 		//在Mode_Read模式下，帮助快速定位目标文件。
 		stHashInfo* m_pHashList;
+		//为了防止频繁的申请和释放内存，这里维护临时缓存。
+		char* m_pTempBuff_SrcFile;
+		char* m_pTempBuff_AfterCompress;
+		soint64 m_nTempBuffMaxSize_SrcFile;
+		soint64 m_nTempBuffMaxSize_AfterCompress;
 		//多线程锁。
 		CRITICAL_SECTION m_Lock;
 	};
