@@ -1,9 +1,12 @@
 ﻿//-----------------------------------------------------------------------------
 #include "SoPackageFile.h"
+#include "SoHash.h"
 using namespace GGUI;
 //-----------------------------------------------------------------------------
 void main()
 {
+	souint32 uiHash = SoHash_PHP("oilok");
+	souint32 uiHash2 = SoHash_BKDR("oilok");
 	SoPackageFile* pPackage = new SoPackageFile;
 	pPackage->InitPackageFile("D:/myPackage.sof", SoPackageFile::Mode_Write);
 	pPackage->InsertSingleFile("D:/game.ini");
